@@ -490,10 +490,6 @@
   .cleaning-branch-head{ display:flex; align-items:center; justify-content:space-between; margin-bottom:4px; }
   .cleaning-branch-name{ font-weight:700; font-size:13px; }
 
-  table.doorlock-table{ width:100%; border-collapse:collapse; font-size:12.5px; }
-  table.doorlock-table th, table.doorlock-table td{ padding:8px 10px; border-bottom:1px solid var(--line); text-align:left; }
-  table.doorlock-table th{ color:var(--ink-soft); font-weight:700; font-size:11px; }
-
   .cal-head{ display:flex; align-items:center; margin-bottom:10px; }
   .cal-head-spacer{ width:16%; flex:none; }
   .cal-head-nav{ flex:1; display:grid; grid-template-columns:auto 1fr auto; align-items:center; gap:10px; }
@@ -733,7 +729,6 @@
       <div style="display:flex; gap:8px; align-items:center;">
         <span class="sub" id="loggedInAs"></span>
         <button class="btn small" id="cleaningBtn">청소 관리</button>
-        <button class="btn small" id="doorlockBtn">도어락 관리</button>
         <button class="btn small" id="shortcutsBtn">바로가기</button>
         <button class="btn small" id="adminBtn" style="display:none;">관리자 설정</button>
         <button class="btn small" id="changePwBtn">비밀번호 변경</button>
@@ -752,7 +747,7 @@ let UI = {
   roomEditMode:{}, residentEditMode:{}, roomSnapshots:{}, residentSnapshots:{}, draftResident:{}, parkingListOpen:{}, residentFieldEdit:{},
   branchEditMode:{}, branchSnapshots:{}, branchInfoOpen:{}, addingBranch:false, addingRoom:false, managingRoom:false, managingTypePrice:false, editingBranchId:null, branchOrderOpen:false,
   tlYear:null, tlMonth:null, tlScrollLeft:null, roomStatusFilter:'전체', cleanWeekStart:null, overdueTabKey:null,
-  cleanTodayPage:1, cleanFuturePage:1, shortcutSelectedId:null, upcomingSoonDays:7, doorlockHistoryOffset:0, roomPriceTableOpen:false
+  cleanTodayPage:1, cleanFuturePage:1, shortcutSelectedId:null, upcomingSoonDays:7, roomPriceTableOpen:false
 };
 
 function uid(p){ return p + '_' + Math.random().toString(36).slice(2,9); }
@@ -970,16 +965,8 @@ const firebaseConfig = {
 firebase.initializeApp(firebaseConfig);
 const firestoreDB = firebase.firestore();
 const FIRESTORE_DOC = firestoreDB.collection('monthliv').doc('state');
-// 도어락 데이터(특히 최근 5일 히스토리)는 지점별 기기 수가 많아지면 용량이 꽤 커서, 지점/호실/
-// 입실자와 같은 문서에 넣으면 Firestore 문서 용량 제한(1MB)에 걸려 저장 자체가 조용히 실패할 수
-// 있다(계약/퇴실 이력을 별도 컬렉션으로 뺀 것과 같은 이유). 그래서 도어락 데이터는 별도 문서에
-// 독립적으로 저장한다.
-const DOORLOCK_DOC = firestoreDB.collection('monthliv').doc('doorlock');
-// 도어락 현황을 로그인 없이 공유할 수 있도록, 도어락 관련 필드만 별도 문서로 한 번 더 미러링한다.
-// (DOORLOCK_DOC도 인증 없이는 못 읽으므로, 공개 링크 전용으로 읽기 권한을 열어둔 문서가 따로 필요하다.)
-const DOORLOCK_PUBLIC_DOC = firestoreDB.collection('monthliv').doc('doorlockPublic');
 // 방 가격 원장. 대시보드와 연장 계산기(Calculator/Extend.html)가 같은 값을 봐야 해서 한 문서에
-// 모아두고, 계산기는 로그인 없이 읽어야 하므로 공개 읽기 규칙을 쓴다(도어락 공개 미러와 같은 구조).
+// 모아두고, 계산기는 로그인 없이 읽어야 하므로 공개 읽기 규칙을 쓴다.
 const ROOM_PRICES_DOC = firestoreDB.collection('monthliv').doc('roomPrices');
 // 지점 직인 이미지. 계약서 발급 화면에서만 쓰는 값이라 메인 상태 문서에는 넣지 않고(문서
 // 용량 제한과 무관한 데이터를 모든 사용자가 매번 함께 내려받게 되는 것을 피하려고), 계약서
@@ -1018,7 +1005,6 @@ function indexEmail(email){
 
 let CURRENT_USER = null;   // { uid, email }
 let USER_ROLE = null;      // 'pending' | 'viewer' | 'editor' | 'superadmin'
-let DOORLOCK_PUBLIC_VIEW = false; // true only on the login-free ?public=doorlock share page
 let USER_BRANCH_SCOPE = 'all'; // 'all' | 'selected' — superadmin is always effectively 'all'
 let USER_BRANCH_IDS = null;    // array of branch ids, only meaningful when scope === 'selected'
 function canEdit(){ return USER_ROLE === 'editor' || USER_ROLE === 'superadmin'; }
@@ -1462,29 +1448,6 @@ function applyLoadedCore(parsed){
   // 불러온(또는 다른 탭에서 받은) 상태를 수정 이력 비교의 기준으로 삼는다 — 남의 변경이 내 이름으로 기록되지 않게.
   resetEditBaseline();
 }
-// 도어락 데이터는 DOORLOCK_DOC(별도 문서)에서 따로 불러와 적용한다 — applyLoadedCore와 분리해둔
-// 이유는, 지점/호실/입실자 실시간 동기화(onSnapshot on FIRESTORE_DOC)가 갱신될 때마다
-// applyLoadedCore가 다시 호출되는데, 그 스냅샷 JSON에는 더 이상 도어락 필드가 들어있지 않으므로
-// 여기서 함께 처리하면 다른 사람이 방/입실자만 수정해도 화면의 도어락 데이터가 매번 빈 값으로
-// 지워져버린다.
-function applyDoorlockCore(parsed){
-  DB.doorlocks = parsed.doorlocks || [];
-  DB.doorlockPrevSnapshot = parsed.doorlockPrevSnapshot || null;
-  DB.doorlockImportDate = parsed.doorlockImportDate || '';
-  DB.doorlockBranchNameOverrides = parsed.doorlockBranchNameOverrides || {};
-  DB.doorlockActionTags = parsed.doorlockActionTags || {};
-  DB.doorlockBranchNotes = parsed.doorlockBranchNotes || {};
-  DB.doorlockBranchLinks = parsed.doorlockBranchLinks || {};
-  DB.doorlockHistory = parsed.doorlockHistory || [];
-  // 마이그레이션: 이 기능 추가 전에 이미 doorlocks/doorlockPrevSnapshot가 쌓여있던 경우,
-  // 히스토리가 비어있으면 최소한 그 두 스냅샷으로 채워 넣어 화살표 이동이 바로 동작하게 한다.
-  if(DB.doorlockHistory.length === 0 && DB.doorlocks.length){
-    if(DB.doorlockPrevSnapshot && DB.doorlockPrevSnapshot.records && DB.doorlockPrevSnapshot.records.length){
-      DB.doorlockHistory.push({ date: DB.doorlockPrevSnapshot.date, records: DB.doorlockPrevSnapshot.records });
-    }
-    DB.doorlockHistory.push({ date: DB.doorlockImportDate, records: DB.doorlocks });
-  }
-}
 // 실시간 동기화로 받은 데이터가 있어도, 지금 화면 어딘가에서 아직 저장 안 된 입력(방/입실자
 // 수정 패널, 신규 입실자 작성 중, 관리자 화면의 지점/호실 추가·관리 폼 등)이 진행 중이면 바로
 // 반영하지 않는다. 그 상태에서 DB를 통째로 바꾸면 화면이 다시 그려지면서 방금 입력하던 내용이
@@ -1624,7 +1587,6 @@ function render(){
   if(UI.view === 'stats'){ main.appendChild(renderStatsView()); return; }
   if(UI.view === 'admin'){ main.appendChild(renderAdminView()); return; }
   if(UI.view === 'cleaning'){ main.appendChild(renderCleaningView()); return; }
-  if(UI.view === 'doorlock'){ main.appendChild(renderDoorlockView()); return; }
   // 정산 계산기(settlement)·연박 체크(staycheck)는 상단 메뉴에서 제외했다. 렌더 함수는
   // 그대로 남겨두었으니, 다시 노출하려면 여기 라우팅과 헤더 버튼만 되살리면 된다.
   // 연박 체크는 별도 페이지로 옮겼다: https://monthliv.github.io/Calculator/CheckDomitory.html
@@ -1657,10 +1619,6 @@ function renderTopNav(){
   const shortcutsBtn = document.getElementById('shortcutsBtn');
   shortcutsBtn.className = 'btn small' + (UI.view==='shortcuts' ? ' primary' : '');
   shortcutsBtn.onclick = ()=>{ UI.view = 'shortcuts'; render(); };
-
-  const doorlockBtn = document.getElementById('doorlockBtn');
-  doorlockBtn.className = 'btn small' + (UI.view==='doorlock' ? ' primary' : '');
-  doorlockBtn.onclick = ()=>{ UI.view = 'doorlock'; render(); };
 
   const adminBtn = document.getElementById('adminBtn');
   adminBtn.style.display = isSuperAdmin() ? '' : 'none';
@@ -7070,10 +7028,6 @@ function downloadFullBackup(){
     branches: DB.branches, rooms: DB.rooms, residents: DB.residents,
     contracts: DB.contracts, residentHistory: DB.residentHistory,
     channelList: DB.channelList, shortcuts: DB.shortcuts,
-    doorlocks: DB.doorlocks, doorlockPrevSnapshot: DB.doorlockPrevSnapshot, doorlockImportDate: DB.doorlockImportDate,
-    doorlockBranchNameOverrides: DB.doorlockBranchNameOverrides, doorlockActionTags: DB.doorlockActionTags,
-    doorlockBranchNotes: DB.doorlockBranchNotes, doorlockHistory: DB.doorlockHistory,
-    doorlockBranchLinks: DB.doorlockBranchLinks,
     backedUpAt: new Date().toISOString()
   };
   const blob = new Blob([JSON.stringify(backup)], { type:'application/json' });
@@ -7436,8 +7390,27 @@ const MGMT_PRICE_RULES = {
   '구로':            { base: '초기세팅가격' }
 };
 
+// 지점명 비교용 정규화(공백·밑줄 제거, 여러 지점에 공통으로 붙는 명칭 제거, 끝의 "점" 제거).
+// 관리표 시트 이름 매칭과 도어락 기기명 매칭 둘 다에서 쓰던 공용 유틸이라 이름은 그대로 둔다.
+const GENERIC_BRANCH_WORDS = ['먼슬리브','레지던스','원룸텔','호텔스테이','스테이'].sort((a,b)=> b.length-a.length);
+function stripGenericBranchWords(s){
+  const hasMonthliv = s.includes('먼슬리브');
+  let cleaned = s;
+  GENERIC_BRANCH_WORDS.forEach(w=>{
+    if((w === '스테이' || w === '호텔스테이') && !hasMonthliv) return;
+    const re = new RegExp(w + '(?!\\d)', 'g');
+    cleaned = cleaned.replace(re, '');
+  });
+  return cleaned.trim();
+}
+function normalizeForDoorlockBranchMatch(s){
+  let cleaned = String(s||'').replace(/[\s_]+/g,'');
+  cleaned = stripGenericBranchWords(cleaned);
+  return cleaned.replace(/점$/, '');
+}
+
 // 관리표의 시트 이름을 대시보드에 등록된 지점명으로 맞춘다. 표기가 서로 달라
-// ("신대방삼거리역A" vs "먼슬리브 신대방삼거리역 A동") 도어락에서 쓰던 정규화를 재사용하되,
+// ("신대방삼거리역A" vs "먼슬리브 신대방삼거리역 A동") 지점명 정규화를 재사용하되,
 // "성수"와 "성수역"처럼 한쪽이 다른 쪽에 포함되는 이름이 있어 정확히 일치하는 것을 먼저 본다.
 function resolveMgmtBranchName(sheetTitle){
   const fallback = { name: '먼슬리브 ' + sheetTitle, matched: false };
@@ -7912,7 +7885,7 @@ function renderRoomPricePanel(){
 const HANDOVER_NOTES = [
   { title: '절대 하지 말 것 (실제로 사고가 났던 것들)', items: [
     'contracts / residentHistory 컬렉션을 통째로 onSnapshot 구독하지 말 것. 접속할 때마다 전체를 다시 읽어 Firestore 무료 요금제의 일일 읽기 한도(5만 건)를 넘긴 적이 있어 롤백했다. 대신 importedAt(계약) / movedAt(퇴실 이력) 커서로 "지금 내가 가진 것보다 나중에 등록된 것만" 구독한다.',
-    '도어락·계약·퇴실 이력 데이터를 monthliv/state 문서 안에 넣지 말 것. 문서 하나당 1MB 한도가 있어 저장이 조용히 실패한다(붙여넣고 저장했는데 다시 접속하면 초기화되어 있는 증상). 도어락은 monthliv/doorlock, 계약·퇴실 이력은 각각 별도 컬렉션이다.',
+    '계약·퇴실 이력처럼 계속 늘어나는 데이터를 monthliv/state 문서 안에 넣지 말 것. 문서 하나당 1MB 한도가 있어 저장이 조용히 실패한다(붙여넣고 저장했는데 다시 접속하면 초기화되어 있는 증상). 계약·퇴실 이력은 각각 별도 컬렉션이다.',
     '지점별 예외를 코드에 하드코딩하지 말 것. 담당자가 직접 켜고 끌 수 있도록 지점 정보 패널의 체크박스로 만든다(예: autoCleaningExcluded = 청소/리터치 자동지정 제외).',
     '청소/리터치 자동지정 제외(autoCleaningExcluded)를 한 곳만 막고 끝내지 말 것. 이 예외는 지금까지 네 곳에서 각각 빠뜨려 같은 제보가 반복됐다: flagUpcomingCleaning(플래그 설정), autoFlagDueRetouch(리터치), collectCleaningEntries의 예정일 미리보기, roomCardMaintKind의 배지 fallback. 특히 마지막 둘은 플래그를 안 걸어도 "퇴실확정된 입실자가 있으면" 화면에 청소 예정을 띄우는 경로라, 플래그만 막으면 사용자 눈에는 여전히 자동 지정된 것으로 보인다. 청소 예정을 새로 표시하는 코드를 추가할 때마다 이 게이트가 필요한지 확인할 것.',
     '컬렉션 로딩 실패를 console.error만 남기고 넘어가지 말 것. "권한 문제로 못 불러온 것"과 "원래 데이터가 없는 것"이 화면상 똑같이 보여서 진단이 불가능해진다. showAlert로 실제 오류를 노출한다.',
@@ -7921,8 +7894,7 @@ const HANDOVER_NOTES = [
   { title: '구조상 알아두어야 할 것', items: [
     '빌드 과정이 없는 단일 index.html이다. main 브랜치에 푸시하면 GitHub Pages가 자동 배포한다(캐시 10분, 확인은 Ctrl+Shift+R).',
     'Firestore 보안 규칙은 이 저장소에 없다. Firebase 콘솔에서만 관리되므로, 새 컬렉션/문서를 추가하면 규칙도 콘솔에서 함께 추가해야 한다. 규칙을 빠뜨리면 권한 오류로 조용히 실패한다.',
-    '도어락 붙여넣기 목록은 매번 기기 수가 다르다(실제로 96~179대까지 널뛴다 — 업체 페이지에서 보이는 만큼만 복사되는 것으로 보인다). 그래서 "지난 목록에 없던 기기 = 새로 끊긴 기기"로 판정하면 안 된다. 원래 1년 전부터 끊겨 있던 방이 신규로 잡힌다(잠실 311·313호 제보). 판정은 마지막 연결 시각이 지난 붙여넣기 날짜보다 나중인지로 한다.',
-    '붙여넣기 파서(계약·도어락·예약)는 열 위치를 세지 않고 앵커 방식이다. 원본 표에서 복사하면 한 건이 여러 줄로 쪼개져 들어오기 때문에, 고정된 패턴(계약일, 시리얼 번호, 숙박 기간 줄)을 기준점으로 잡고 그 앞뒤에서 값을 찾는다.',
+    '붙여넣기 파서(계약·예약)는 열 위치를 세지 않고 앵커 방식이다. 원본 표에서 복사하면 한 건이 여러 줄로 쪼개져 들어오기 때문에, 고정된 패턴(계약일, 숙박 기간 줄)을 기준점으로 잡고 그 앞뒤에서 값을 찾는다.',
     '방 가격은 monthliv/roomPrices 문서 하나에 모아두고 대시보드와 연장·환불 계산기가 함께 읽는다(두 계산기는 Calculator 저장소의 room-prices.js 하나를 공유하며 SDK 없이 Firestore REST로 읽으므로 이 문서만 공개 읽기 권한이 필요하다). 환불 계산기는 embed.js로 다른 페이지에 삽입되어 쓰이고 이 원장의 1인 입실료로 정상 입실료를 채우므로, 원장 업로드는 환불 예상 금액에도 바로 영향을 준다. 대시보드는 이 문서를 실시간 구독하므로, 업로드하면 켜둔 모든 탭의 방 카드 가격이 새로고침 없이 바뀐다. 업로드는 두 가지 형식을 받는다 — 대시보드가 내려준 가격표(호실 1개 = 1행), 그리고 실무에서 쓰는 지점정보_관리표.xlsm 원본. 관리표는 시트마다 기준 가격 열 이름이 다르고(가격/성수기가격/변동가격/초기 세팅 가격) 같은 헤더가 한 시트에 두 번 나오므로, 열 위치를 세지 말고 이름으로 찾을 것. 두 번째 "방타입" 열이 호실별 표와 방타입별 1박 요금 참조표의 경계다.',
     '관리표에 1박 금액이 비어 있는 지점이 있다(오산의 신규 1박). 빈 칸을 0원으로 덮어쓰면 연장 계산기가 0원을 계산하므로, 업로드 시 그런 칸은 원장에 이미 있는 금액을 유지한다. 이 안전장치를 제거하지 말 것.',
     '같은 지점·룸타입인데 호실마다 가격이 다른 곳이 있다(구로 트리니티B는 3가지, 고려대 206호). 그래서 연장·환불 계산기에는 룸타입 선택이 없고(담당자 요청으로 삭제), 지점에서 호실을 바로 골라 그 호실이 들어있는 행에서 가격을 가져온다. 룸타입으로 찾으면 나머지 가격대의 호실이 사라지거나 금액이 틀린다.',
@@ -7983,7 +7955,6 @@ function buildHandoverDoc(){
   L.push('| 입실자(재실·입실예정) | ' + (DB.residents||[]).length + '명 |');
   L.push('| 계약 이력 | ' + (DB.contracts||[]).length + '건 |');
   L.push('| 퇴실 이력 | ' + (DB.residentHistory||[]).length + '건 |');
-  L.push('| 도어락 기기 | ' + (DB.doorlocks||[]).length + '대 |');
   L.push('');
 
   // 수수료율·보증금 관리는 이 대시보드에서 관리하는 항목이 아니라 넣지 않는다.
@@ -9851,927 +9822,6 @@ function renderCleaningCard(title, list, showDate){
   return card;
 }
 
-/* ---------------- 도어락 관리: 원격 도어락 업체 페이지에서 복사한 표를 붙여넣어 지점·호실별
-   연결 현황으로 정리한다. 계약 데이터 붙여넣기와 같은 방식(헤더 포함 표 붙여넣기)을 쓰되,
-   원본 표의 "마지막 연결" 칸이 날짜와 연결상태(연결/미연결) 두 줄로 이루어져 있어 탭/줄바꿈
-   위치가 불규칙할 수 있으므로, 칸 위치가 아니라 일련번호(hex)·날짜·연결상태 같은 값 자체의
-   패턴을 기준(anchor)으로 각 행을 인식한다. */
-// 신대방삼거리역은 소속명만으로는 A동/B동이 구분되지 않지만 실제로는 서로 다른 건물이라,
-// 기기명에 남아있는 "A동"/"B동" 표기를 찾아 지점 그룹명에 붙여 구분한다(공간명은 쓰지 않는다.
-// branchParkingCombineGroup과 같은 이유로 이 지점만 예외 처리 — 다른 지점은 해당 없음).
-function applyDoorlockBuildingSplit(branchGroup, deviceName){
-  if(!branchGroup.replace(/\s+/g,'').includes('신대방삼거리')) return branchGroup;
-  const m = deviceName.match(/([A-Za-z0-9]{1,3})동/);
-  if(!m) return branchGroup;
-  const marker = m[1].toUpperCase() + '동';
-  // branchGroup을 뽑아낸 조각에 이미 건물 표기가 붙어있으면(예: "신대방삼거리역A동") 중복으로
-  // 또 붙이지 않는다.
-  if(branchGroup.toUpperCase().includes(marker)) return branchGroup;
-  return `${branchGroup} ${marker}`;
-}
-// 여러 지점에 공통으로 붙어 지점 구분에 의미가 없는 명칭들. 길이가 긴 것부터 지워야
-// "호텔스테이"처럼 짧은 단어("스테이")를 포함하는 합성어도 통째로 지워진다.
-const DOORLOCK_GENERIC_WORDS = ['먼슬리브','레지던스','원룸텔','호텔스테이','스테이'].sort((a,b)=> b.length-a.length);
-function doorlockStripGenericWords(s){
-  // "스테이"/"호텔스테이"는 먼슬리브 소속 기기의 일반적인 명칭 표기(예: "먼슬리브강남스테이"
-  // -> "강남")일 때만 지운다. "먼슬리브"가 아예 없는 곳(다른 업체·건물의 고유 명칭)에 들어있는
-  // "스테이"는 그 이름의 일부이므로 그대로 유지한다.
-  const hasMonthliv = s.includes('먼슬리브');
-  let cleaned = s;
-  DOORLOCK_GENERIC_WORDS.forEach(w=>{
-    if((w === '스테이' || w === '호텔스테이') && !hasMonthliv) return;
-    // 바로 뒤에 숫자가 오면(예: "스테이79") 일반 명칭이 아니라 그 지점 고유의 이름 일부일
-    // 수 있어 지우지 않는다.
-    const re = new RegExp(w + '(?!\\d)', 'g');
-    cleaned = cleaned.replace(re, '');
-  });
-  return cleaned.trim();
-}
-// 기기명의 "가장 마지막" 밑줄(_)을 기준으로 앞부분을 지점명, 뒷부분을 방 이름으로 나눈다.
-// 지점명 쪽은 띄어쓰기(및 안쪽에 남아있는 밑줄)를 무시하고 붙여서 정리한 뒤 "먼슬리브"처럼
-// 여러 지점에 공통으로 붙는 명칭을 지운다 — 표기가 살짝 달라도(공백 유무 등) 안전하게 지워진다.
-function doorlockSplitDeviceName(deviceName){
-  const name = String(deviceName||'').trim();
-  const idx = name.lastIndexOf('_');
-  if(idx === -1){
-    const compact = doorlockStripGenericWords(name.replace(/\s+/g,''));
-    return { branch: compact || name, room: name };
-  }
-  const branchRaw = name.slice(0, idx);
-  const room = name.slice(idx + 1).trim();
-  const branchCompact = branchRaw.replace(/[\s_]+/g, '');
-  const branch = doorlockStripGenericWords(branchCompact) || branchCompact || branchRaw;
-  return { branch, room };
-}
-function parseDoorlockPaste(text){
-  const tokens = String(text||'').split(/[\t\n]/).map(t=> t.trim()).filter(t=> t!=='');
-  const SERIAL_RE = /^[0-9A-Fa-f]{10,20}$/;
-  const DATE_RE = /^\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}(:\d{2})?$/;
-  const records = [];
-  let i = 0;
-  while(i < tokens.length){
-    while(i < tokens.length && !SERIAL_RE.test(tokens[i])) i++;
-    if(i >= tokens.length) break;
-    const serial = tokens[i];
-    const deviceName = tokens[i-1] || '';
-    let j = i+1;
-    const affiliation = tokens[j++] || '';
-    const spaceName = tokens[j++] || '';
-    const ssid = tokens[j++] || '';
-    const battery = tokens[j++] || '';
-    let lastConnected = '';
-    if(j < tokens.length && DATE_RE.test(tokens[j])){ lastConnected = tokens[j]; j++; }
-    let connected = true;
-    if(j < tokens.length && (tokens[j]==='연결' || tokens[j]==='미연결')){
-      connected = tokens[j] === '연결';
-      j++;
-    }
-    let owner = '';
-    if(j < tokens.length && !SERIAL_RE.test(tokens[j])){ owner = tokens[j]; j++; }
-    // 기기명을 밑줄 기준으로 앞(지점명)/뒤(방 이름)로 나눈다. 방 이름에 숫자+"호"가 있으면
-    // 배지에는 숫자만 보여준다(roomNumber). "호"가 안 붙고 숫자만 있는 경우(예: "먼슬리브오산_805",
-    // "호" 없이 등록된 기기명)도 있어, 방 이름 전체가 숫자뿐이면 그것도 방 번호로 인정한다 —
-    // 안 그러면 실제 지점 연결 시 방 번호로 매칭이 안 돼 입실자 유무를 확인할 수 없다("3층현관"처럼
-    // 숫자 외 다른 글자가 섞인 공용구역은 여전히 매칭되지 않는다).
-    const parts = doorlockSplitDeviceName(deviceName);
-    const branchGroup = applyDoorlockBuildingSplit(parts.branch, deviceName);
-    const roomMatch = parts.room.match(/(\d+)\s*호/) || parts.room.match(/^(\d+)$/);
-    const roomNumber = roomMatch ? roomMatch[1] : '';
-    records.push({ id: serial, deviceName, serial, affiliation, spaceName, ssid, battery, lastConnected, connected, owner, branchGroup, roomText: parts.room, roomNumber });
-    i = j;
-  }
-  return records;
-}
-function importDoorlockRecords(records, onImported){
-  if(!records || records.length===0){
-    showAlert('인식된 도어락 데이터가 없습니다. 표 전체(헤더 포함)를 그대로 붙여넣었는지 확인해주세요.');
-    return;
-  }
-  const prevRecords = DB.doorlocks || [];
-  // 이전에 붙여넣은 데이터가 있으면(최초 등록이 아니면) 비교 기준으로 남겨둔다 — 매번 새로
-  // 붙여넣을 때마다 "지난 붙여넣기 대비" 스냅샷이 한 단계씩 앞으로 이동한다.
-  if(prevRecords.length > 0){
-    DB.doorlockPrevSnapshot = { date: DB.doorlockImportDate || '이전', records: prevRecords };
-  }
-  // 상단 "처리 방법별 방 목록"(아톡/청소방/현장출동)은 새 데이터를 붙여넣을 때마다 통째로
-  // 초기화한다 — 예전엔 미연결->연결로 정상화된 기기의 태그만 선택적으로 지웠지만, 매번
-  // 새로 붙여넣는 시점에 이전 처리 방법 표시는 모두 리셋해달라는 요청으로 전체 초기화로
-  // 바뀌었다. 지점명 수정(doorlockBranchNameOverrides)·특이사항 메모(doorlockBranchNotes)는
-  // 이 초기화 대상이 아니며 기존 규칙대로 계속 유지된다.
-  DB.doorlockActionTags = {};
-  DB.doorlocks = records;
-  DB.doorlockImportDate = localDateKey();
-  // 최근 5일치 히스토리를 남겨서 화살표로 지난 날짜를 넘겨볼 수 있게 한다(오래된 순).
-  // 같은 날 여러 번 붙여넣으면 그날 기록만 최신 내용으로 갱신한다.
-  if(!DB.doorlockHistory) DB.doorlockHistory = [];
-  const lastEntry = DB.doorlockHistory[DB.doorlockHistory.length - 1];
-  // 특이사항 메모(doorlockBranchNotes)는 actionTags와 달리 붙여넣기로 초기화되지 않고 계속
-  // 이어지는 값이지만, "그날의 메모가 무엇이었는지"도 actionTags처럼 그날 히스토리 항목에
-  // 얼려서 남겨둔다 — 그래야 화살표로 지난 날짜를 봐도 그날 실제로 적혀 있던 메모를 보여줄 수
-  // 있고, 오늘 메모를 고쳐도 이미 지나간 날짜의 기록은 그대로 유지된다.
-  if(lastEntry && lastEntry.date === DB.doorlockImportDate){
-    lastEntry.records = records;
-    lastEntry.actionTags = DB.doorlockActionTags;
-    lastEntry.branchNotes = DB.doorlockBranchNotes || {};
-  } else {
-    DB.doorlockHistory.push({ date: DB.doorlockImportDate, records, actionTags: DB.doorlockActionTags, branchNotes: DB.doorlockBranchNotes || {} });
-    if(DB.doorlockHistory.length > 5) DB.doorlockHistory.shift();
-  }
-  logChange(`도어락 데이터 붙여넣기: ${records.length}건 갱신`);
-  saveDoorlockState();
-  syncDoorlockPublicMirror();
-  render();
-  if(onImported) onImported();
-}
-// 도어락 데이터의 실제 저장소(DOORLOCK_DOC)에 지금 DB에 있는 도어락 관련 필드를 통째로 쓴다.
-// FIRESTORE_DOC(지점/호실/입실자)와 분리된 별도 문서라 트랜잭션 충돌 검사는 두지 않았다 — 도어락
-// 데이터는 보통 한 번에 한 사람이 붙여넣고, 마지막에 쓴 내용이 이기는 정도로 충분하다. 실패하면
-// (예: 문서 용량 제한 재발) 조용히 넘어가지 않고 사용자에게 바로 알린다 — 예전에 이 저장이 조용히
-// 실패해서 "붙여넣고 저장했는데 다시 접속하면 초기화되어 있다"는 문제가 있었다.
-function saveDoorlockState(){
-  DOORLOCK_DOC.set({
-    doorlocks: DB.doorlocks || [],
-    doorlockPrevSnapshot: DB.doorlockPrevSnapshot || null,
-    doorlockImportDate: DB.doorlockImportDate || '',
-    doorlockHistory: DB.doorlockHistory || [],
-    doorlockBranchNameOverrides: DB.doorlockBranchNameOverrides || {},
-    doorlockActionTags: DB.doorlockActionTags || {},
-    doorlockBranchNotes: DB.doorlockBranchNotes || {},
-    doorlockBranchLinks: DB.doorlockBranchLinks || {},
-    updatedAt: new Date().toISOString()
-  }).catch(e=>{
-    console.error('도어락 데이터 저장 실패:', e);
-    showAlert(`도어락 데이터 저장에 실패했습니다. 방금 하신 변경사항이 저장되지 않았을 수 있습니다.\n\n오류 내용: ${(e && e.message) || e}`);
-  });
-}
-// 로그인 없이 볼 수 있는 공유 링크(?public=doorlock)용으로, 도어락 관련 필드만 별도 문서에
-// 한 번 더 복사해둔다(DOORLOCK_DOC은 인증 없이는 못 읽으므로). 입주자 개인정보가 담긴 나머지
-// 상태(branches/rooms/residents)는 포함하지 않는다.
-function syncDoorlockPublicMirror(){
-  DOORLOCK_PUBLIC_DOC.set({
-    doorlocks: DB.doorlocks || [],
-    doorlockPrevSnapshot: DB.doorlockPrevSnapshot || null,
-    doorlockImportDate: DB.doorlockImportDate || '',
-    doorlockHistory: DB.doorlockHistory || [],
-    doorlockBranchNameOverrides: DB.doorlockBranchNameOverrides || {},
-    doorlockBranchNotes: DB.doorlockBranchNotes || {},
-    doorlockActionTags: DB.doorlockActionTags || {},
-    updatedAt: new Date().toISOString()
-  }).catch(e=> console.error('공유용 도어락 데이터 동기화 실패:', e));
-}
-// 히스토리에서 offsetFromLatest(0=최신)만큼 과거로 이동한 스냅샷과, 그 비교 기준(하루 전)이 될
-// 스냅샷을 함께 반환한다. 히스토리가 비어 있으면 null.
-function getDoorlockSnapshotAt(offsetFromLatest){
-  const hist = DB.doorlockHistory || [];
-  if(hist.length === 0) return null;
-  const idx = hist.length - 1 - offsetFromLatest;
-  if(idx < 0 || idx >= hist.length) return null;
-  const current = hist[idx];
-  const prev = idx > 0 ? hist[idx-1] : null;
-  // 오늘(offsetFromLatest===0)은 항상 DB.doorlockActionTags(라이브 값)를 우선한다 — 히스토리
-  // 항목의 actionTags는 원래 그 라이브 값을 그대로 미러링해두는 캐시일 뿐인데, 오래된 탭이
-  // 배포 전 코드로 태그만 바꾸고 히스토리 쪽 동기화를 안 하는 경우(코드가 그 동기화 호출을
-  // 아직 모르는 상태) 등으로 어긋날 수 있다. 과거 날짜는 그 시점의 값 외엔 알 방법이 없으므로
-  // current.actionTags를 그대로 쓴다.
-  const actionTags = offsetFromLatest === 0 ? (DB.doorlockActionTags || {}) : (current.actionTags || {});
-  // 특이사항 메모도 actionTags와 같은 이유로 오늘은 항상 라이브 값(DB.doorlockBranchNotes)을
-  // 우선한다 — 히스토리 항목의 branchNotes는 얼려둔 캐시일 뿐이라, 오늘 메모를 수정한 직후에는
-  // (동기화 호출 전이거나 옛 코드가 실행 중인 탭이면) 캐시가 아직 갱신 전일 수 있다. 지나간
-  // 날짜는 그 시점에 얼려둔 값 외엔 알 방법이 없으므로 current.branchNotes를 그대로 쓴다.
-  const branchNotes = offsetFromLatest === 0 ? (DB.doorlockBranchNotes || {}) : (current.branchNotes || {});
-  return { date: current.date, records: current.records, prevRecords: prev ? prev.records : null, prevDate: prev ? prev.date : null, actionTags, branchNotes };
-}
-function showDoorlockPasteModal(){
-  const overlay = document.createElement('div');
-  overlay.className = 'modal-overlay';
-  const box = document.createElement('div');
-  box.className = 'modal-box';
-  box.style.maxWidth = '640px';
-  const close = ()=> overlay.remove();
-  box.innerHTML = `
-    <div class="modal-msg" style="margin-bottom:10px;font-weight:700;">도어락 데이터 붙여넣기</div>
-    <div style="font-size:11.5px;color:var(--ink-soft);margin-bottom:10px;line-height:1.6;">
-      도어락 관리 업체 페이지에서 표 전체(헤더 포함)를 그대로 복사해 아래에 붙여넣어주세요.<br>
-      (기기명, 일련번호, 소속명, 공간명, SSID, 배터리, 마지막 연결, 소유자 순서)
-    </div>
-  `;
-  const textarea = document.createElement('textarea');
-  textarea.rows = 12;
-  textarea.style.cssText = 'width:100%;font-family:monospace;font-size:11.5px;';
-  textarea.placeholder = '기기명\t일련번호\t소속명\t공간명\tSSID\t배터리\t마지막 연결\t소유자';
-  box.appendChild(textarea);
-
-  const btnRow = document.createElement('div');
-  btnRow.className = 'modal-btn-row';
-  const cancelBtn = document.createElement('button');
-  cancelBtn.className = 'btn'; cancelBtn.textContent = '취소'; cancelBtn.onclick = close;
-  const importBtn = document.createElement('button');
-  importBtn.className = 'btn primary'; importBtn.textContent = '가져오기';
-  importBtn.onclick = ()=>{
-    const records = parseDoorlockPaste(textarea.value);
-    importDoorlockRecords(records, close);
-  };
-  btnRow.appendChild(cancelBtn); btnRow.appendChild(importBtn);
-  box.appendChild(btnRow);
-
-  overlay.addEventListener('click', (e)=>{ if(e.target===overlay) close(); });
-  overlay.appendChild(box);
-  document.body.appendChild(overlay);
-  setTimeout(()=> textarea.focus(), 0);
-}
-// branchGroup(기기명 밑줄 앞부분, 중복 명칭 제외 처리까지 끝난 값)이 곧 지점명이다.
-// 자동 정리 결과가 마음에 안 들면 지점별 미연결 방 표에서 지점명을 직접 클릭해 수정할 수
-// 있고, 그 수정값이 있으면 항상 우선한다.
-function doorlockBranchLabel(branchGroup){
-  if(DB.doorlockBranchNameOverrides && DB.doorlockBranchNameOverrides[branchGroup]) return DB.doorlockBranchNameOverrides[branchGroup];
-  return branchGroup || '기타';
-}
-// 호실번호가 있으면 숫자만, 없으면(방이 아닌 공용공간 등) 기기명 밑줄 뒷부분(roomText)을
-// 그대로 방 이름으로 쓴다.
-function doorlockRoomLabel(r){
-  if(r.roomNumber) return r.roomNumber;
-  return r.roomText || r.deviceName || '(이름 없음)';
-}
-const DOORLOCK_ACTION_TAGS = ['아톡', '청소방', '현장출동'];
-// 미연결 방을 클릭해 처리 방법(아톡/청소방/현장출동)을 지정한다. serial로 저장해두면
-// 다음 붙여넣기에도 같은 기기를 계속 추적할 수 있고, 연결이 정상화되면 자동으로 해제된다
-// (importDoorlockRecords 참고).
-// 처리 방법(아톡/청소방/현장출동) 태그는 히스토리(doorlockHistory)의 "오늘(최신)" 항목에도
-// 그대로 반영해둔다 — 그래야 나중에 화살표로 오늘을 다시 봐도 그때 태그가 정확히 남아있고,
-// 다음 날 새로 붙여넣을 때 그 이전 기록은 건드리지 않은 채로 그대로 얼려둘 수 있다. Firestore
-// 저장/로딩을 거치면 DB.doorlockActionTags와 히스토리 항목의 actionTags가 서로 다른 객체가
-// 되어버리므로(참조 공유가 끊김), 매번 명시적으로 다시 맞춰준다.
-function syncDoorlockActionTagsToTodayHistory(){
-  if(!DB.doorlockHistory || !DB.doorlockHistory.length) return;
-  DB.doorlockHistory[DB.doorlockHistory.length - 1].actionTags = DB.doorlockActionTags;
-}
-// 특이사항 메모도 같은 이유로 오늘(최신) 히스토리 항목에 맞춰준다 — actionTags와 마찬가지로
-// Firestore 저장/로딩을 거치면 DB.doorlockBranchNotes와 히스토리 항목의 branchNotes가 서로
-// 다른 객체가 되므로, 메모를 수정할 때마다 명시적으로 다시 동기화해야 한다.
-function syncDoorlockBranchNotesToTodayHistory(){
-  if(!DB.doorlockHistory || !DB.doorlockHistory.length) return;
-  DB.doorlockHistory[DB.doorlockHistory.length - 1].branchNotes = DB.doorlockBranchNotes;
-}
-function showDoorlockActionModal(serial, label){
-  const overlay = document.createElement('div');
-  overlay.className = 'modal-overlay';
-  const box = document.createElement('div');
-  box.className = 'modal-box';
-  const close = ()=> overlay.remove();
-  box.appendChild(el('div', 'modal-msg', `"${label}" 처리 방법 선택`, 'margin-bottom:12px;font-weight:700;'));
-
-  const currentTag = DB.doorlockActionTags && DB.doorlockActionTags[serial] && DB.doorlockActionTags[serial].tag;
-  const btnCol = document.createElement('div');
-  btnCol.style.cssText = 'display:flex;flex-direction:column;gap:8px;';
-  DOORLOCK_ACTION_TAGS.forEach(tag=>{
-    const btn = document.createElement('button');
-    btn.className = 'btn' + (tag===currentTag ? ' primary' : '');
-    btn.textContent = tag;
-    btn.onclick = ()=>{
-      if(!DB.doorlockActionTags) DB.doorlockActionTags = {};
-      DB.doorlockActionTags[serial] = { tag, label };
-      syncDoorlockActionTagsToTodayHistory();
-      logChange(`도어락 "${label}" 처리 방법 설정: ${tag}`);
-      saveDoorlockState(); syncDoorlockPublicMirror(); close(); render();
-    };
-    btnCol.appendChild(btn);
-  });
-  if(currentTag){
-    const clearBtn = document.createElement('button');
-    clearBtn.className = 'btn danger';
-    clearBtn.textContent = '처리 방법 해제';
-    clearBtn.onclick = ()=>{
-      delete DB.doorlockActionTags[serial];
-      syncDoorlockActionTagsToTodayHistory();
-      logChange(`도어락 "${label}" 처리 방법 해제`);
-      saveDoorlockState(); syncDoorlockPublicMirror(); close(); render();
-    };
-    btnCol.appendChild(clearBtn);
-  }
-  box.appendChild(btnCol);
-
-  const btnRow = document.createElement('div');
-  btnRow.className = 'modal-btn-row';
-  const cancelBtn = document.createElement('button');
-  cancelBtn.className = 'btn'; cancelBtn.textContent = '닫기'; cancelBtn.onclick = close;
-  btnRow.appendChild(cancelBtn);
-  box.appendChild(btnRow);
-
-  overlay.addEventListener('click', (e)=>{ if(e.target===overlay) close(); });
-  overlay.appendChild(box);
-  document.body.appendChild(overlay);
-}
-// 처리 방법(아톡/청소방/현장출동)이 지정된 방을 지점과 함께 상단에 모아 보여준다. tags는
-// 보고 있는 날짜(오늘 또는 과거)의 스냅샷이고, editable이 false면(과거 기록 조회 중) 클릭해서
-// 바꾸는 기능을 막는다.
-function renderDoorlockActionSummary(tags, editable){
-  tags = tags || {};
-  const entries = Object.keys(tags).map(serial=> ({ serial, ...tags[serial] }));
-  if(entries.length === 0) return null;
-  const box = document.createElement('div');
-  box.className = 'stat-section';
-  box.innerHTML = `<h3 style="margin:0 0 12px;">처리 방법별 방 목록</h3>`;
-  const grid = document.createElement('div');
-  grid.style.cssText = 'display:grid; grid-template-columns:repeat(auto-fit, minmax(180px, 1fr)); gap:14px;';
-  DOORLOCK_ACTION_TAGS.forEach(tagName=>{
-    const list = entries.filter(e=> e.tag===tagName);
-    const col = document.createElement('div');
-    col.innerHTML = `<div style="font-weight:700;margin-bottom:6px;">${esc(tagName)} <span class="cnt-badge">${list.length}</span></div>`;
-    if(list.length===0){
-      col.appendChild(el('div','cleaning-empty','없음'));
-    } else {
-      const wrap = document.createElement('div');
-      wrap.style.cssText = 'display:flex;flex-wrap:wrap;gap:6px;';
-      list.forEach(e=>{
-        const chip = document.createElement('span');
-        chip.className = 'badge';
-        chip.style.cssText = 'background:var(--accent-soft); color:var(--accent-ink);';
-        chip.textContent = e.label;
-        if(canEdit() && editable){
-          chip.style.cursor = 'pointer';
-          chip.title = '클릭하여 처리 방법 변경/해제';
-          chip.onclick = ()=> showDoorlockActionModal(e.serial, e.label);
-        }
-        wrap.appendChild(chip);
-      });
-      col.appendChild(wrap);
-    }
-    grid.appendChild(col);
-  });
-  box.appendChild(grid);
-  return box;
-}
-// 마지막 연결(lastConnected, "YYYY-MM-DD HH:MM:SS")로부터 오늘까지 며칠 지났는지. 연결 기록이
-// 아예 없거나 날짜를 못 읽으면 가장 오래된 것으로 취급한다(Infinity) — 기록이 없다는 것 자체가
-// 이미 한참 방치됐다는 뜻이므로.
-function doorlockDaysSinceLastConnected(record){
-  if(!record.lastConnected) return Infinity;
-  const parsed = new Date(record.lastConnected.slice(0, 10));
-  if(isNaN(parsed.getTime())) return Infinity;
-  return Math.round((new Date(todayISO()) - parsed) / 86400000);
-}
-const DOORLOCK_LONG_OVERDUE_DAYS = 30;
-// 직전 붙여넣기(doorlockPrevSnapshot) 대비 현재 미연결 기기의 상태를 분류한다.
-// existing: 그때도 미연결·지금도 미연결 / new: 그때는 괜찮았는데 지금 미연결(또는 신규 기기) /
-// longOverdue: existing인데 마지막 연결로부터 30일 이상 지난 것(장기 미연결, 회색으로 구분).
-// "정상 연결됨"(그때 미연결이었는데 지금은 연결됨)은 이 목록에 섞지 않고 상단의 별도
-// 카드(renderDoorlockResolvedSection)에서 하루만 보여준 뒤 자연히 빠진다.
-// 붙여넣는 목록에 매번 같은 기기가 다 들어오지는 않는다(실제로 하루 96~179대까지 널뛴다 —
-// 업체 페이지에서 보이는 만큼만 복사되는 것으로 보인다). 그래서 "이전 목록에 없다"는 사실만으로
-// 신규 미연결이라고 볼 수 없다. 그 기기가 그동안 연결이었는지 미연결이었는지 모를 뿐이다.
-// 마지막 연결 시각이 판정 근거가 된다: 이전 붙여넣기 시점보다 나중에 끊겼으면 그 사이에 새로
-// 끊긴 것이고, 그보다 오래됐으면 이미 그전부터 끊겨 있던 기기다(잠실 311호는 마지막 연결이
-// 1년 전인데 신규로 잡히고 있었다).
-function doorlockNewlyDisconnected(record, prevDate){
-  if(!prevDate) return false;              // 비교 기준이 없으면 신규라고 단정하지 않는다
-  if(!record.lastConnected) return false;  // 한 번도 연결된 적 없음 = 새로 끊긴 게 아니다
-  return record.lastConnected.slice(0, 10) >= prevDate;
-}
-function computeDoorlockChipList(records, prevRecords, prevDate){
-  const prevBySerial = new Map((prevRecords || []).map(r=>[r.serial, r]));
-  const chips = [];
-  records.forEach(r=>{
-    if(!r.connected){
-      const prev = prevBySerial.get(r.serial);
-      // 이전 목록에 있으면 그때 상태로 확실히 판정하고, 없으면 마지막 연결 시각으로 추정한다.
-      const isExisting = prev ? (prev.connected === false) : !doorlockNewlyDisconnected(r, prevDate);
-      let status;
-      if(isExisting && doorlockDaysSinceLastConnected(r) >= DOORLOCK_LONG_OVERDUE_DAYS) status = 'longOverdue';
-      else status = isExisting ? 'existing' : 'new';
-      chips.push({ record: r, status });
-    }
-  });
-  return chips;
-}
-// 기존(existing)과 신규(new)가 둘 다 따뜻한 톤(amber/red)이라 구분이 잘 안 된다는 피드백으로,
-// 기존은 차가운 톤(cyan)으로 바꿔 신규(red)와 뚜렷이 대비되게 했다. 장기 미연결은 회색
-// (--st-vacant, 공실 배지와 같은 색을 재사용 — 새 CSS 변수를 추가하지 않아도 됨).
-const DOORLOCK_STATUS_COLORS = {
-  existing: { bg:'var(--st-imported-bg)', fg:'var(--st-imported)' },
-  new: { bg:'var(--st-hold-bg)', fg:'var(--st-hold)' },
-  longOverdue: { bg:'var(--st-vacant-bg)', fg:'var(--st-vacant)' }
-};
-// 지점 구분: 소속명(affiliation)에 "먼슬리브"가 들어있으면 먼슬리브 직영 지점, 그렇지 않고
-// 다른 회사 브랜드로 표기돼 있으면(예: 달해스테이·더쉼·블루스테이 등) 입점고시원으로 분류한다.
-// 먼슬리브 직영 중에서도 기기명에 "호텔스테이"가 들어있으면(예: "먼슬리브 청량리 호텔스테이_...")
-// 별도로 호텔스테이로 더 세분화한다 — 소속명은 지점마다 "호텔 스테이"/"호스텔" 등으로 표기가
-// 갈려 신뢰할 수 없어서, 기기명 원문 쪽을 기준으로 판단한다.
-const DOORLOCK_CATEGORY_ORDER = ['입점고시원', '먼슬리브', '호텔스테이'];
-function doorlockCategoryForGroup(group){
-  const rec = group.records.find(r=> r.affiliation);
-  if(!rec || !rec.affiliation.includes('먼슬리브')) return '입점고시원';
-  const isHotelStay = group.records.some(r=> (r.deviceName||'').includes('호텔스테이'));
-  return isHotelStay ? '호텔스테이' : '먼슬리브';
-}
-// 도어락 지점명(기기명에서 뽑아낸 것)을 실제 대시보드에 등록된 지점과 이름 기준으로 자동
-// 매칭한다 — 회사 공통 단어(먼슬리브 등, doorlockStripGenericWords 재사용)와 끝의 "점"을 지운
-// 뒤 서로 포함 관계면 같은 지점으로 본다. 완벽하지 않을 수 있어 doorlockBranchLinks로 직접
-// 연결을 지정해 덮어쓸 수 있게 해둔다(그쪽이 항상 우선). DB.branches가 없는 화면(공유 링크 등
-// 도어락 데이터만 불러온 상태)에서는 조용히 null을 반환한다.
-function normalizeForDoorlockBranchMatch(s){
-  let cleaned = String(s||'').replace(/[\s_]+/g,'');
-  cleaned = doorlockStripGenericWords(cleaned);
-  return cleaned.replace(/점$/, '');
-}
-function autoMatchDoorlockBranch(doorlockLabel){
-  if(!DB.branches) return null;
-  const norm = normalizeForDoorlockBranchMatch(doorlockLabel);
-  if(!norm) return null;
-  return DB.branches.find(b=>{
-    const bn = normalizeForDoorlockBranchMatch(b.name);
-    return bn && (bn.includes(norm) || norm.includes(bn));
-  }) || null;
-}
-// 화면에 보여줄 지점 라벨(병합된 행)에 대해, 수동으로 연결해둔 실제 지점(doorlockBranchLinks)이
-// 있으면 그걸 우선 쓰고, 없으면 이름 기준 자동 매칭 결과를 쓴다.
-function doorlockResolveBranchLink(group, label){
-  const linkedId = group.keys.map(k=> DB.doorlockBranchLinks && DB.doorlockBranchLinks[k]).find(Boolean);
-  if(linkedId && DB.branches){
-    const linked = DB.branches.find(b=> b.id === linkedId);
-    if(linked) return linked;
-  }
-  return autoMatchDoorlockBranch(label);
-}
-function renderDoorlockDisconnectedSection(records, prevRecords, dateForTitle, editable, branchNotes, prevDate){
-  branchNotes = branchNotes || {};
-  const box = document.createElement('div');
-  box.className = 'stat-section';
-  const dateSlash = (dateForTitle || localDateKey()).replace(/-/g,'/');
-  const legendDot = (color)=> `<span style="display:inline-block;width:9px;height:9px;border-radius:50%;background:${color};margin-right:4px;"></span>`;
-  box.innerHTML = `
-    <div style="display:flex; align-items:baseline; justify-content:space-between; flex-wrap:wrap; gap:8px; margin-bottom:12px;">
-      <h3 style="margin:0;font-size:16px;">지점별 도어락 미연결 정보 (${esc(dateSlash)})</h3>
-      <div style="display:flex; gap:14px; flex-wrap:wrap; font-size:11.5px; color:var(--ink-soft);">
-        <span>${legendDot('var(--st-imported)')}기존 미연결</span>
-        <span>${legendDot('var(--st-hold)')}신규 미연결</span>
-        <span>${legendDot('var(--st-vacant)')}${DOORLOCK_LONG_OVERDUE_DAYS}일 이상 미연결</span>
-      </div>
-    </div>`;
-
-  const chipBySerial = new Map(computeDoorlockChipList(records, prevRecords, prevDate).map(c=> [c.record.serial, c]));
-
-  // 1차: 기기명 기준 그룹핑 키(branchGroup)별로 묶는다(연결에 문제 없는 지점도 "전체
-  // 연결됨"으로 보여주기 위해 전체 레코드를 기준으로 묶는다).
-  const rawGroups = {};
-  records.forEach(r=>{
-    const key = r.branchGroup || '기타';
-    (rawGroups[key] = rawGroups[key] || []).push(r);
-  });
-  // 2차: 화면에 보여줄 지점명이 같으면 한 행으로 합친다 — 기기명 패턴이 같은 지점 안에서도
-  // 완전히 통일돼있지 않으면 같은 지점이 서로 다른 branchGroup으로 쪼개질 수 있는데, 지점명이
-  // 같다면 화면에는 하나로 보여줘야 한다.
-  const displayGroups = {};
-  Object.keys(rawGroups).forEach(key=>{
-    const groupRecords = rawGroups[key];
-    const label = doorlockBranchLabel(key);
-    if(!displayGroups[label]) displayGroups[label] = { keys: [], records: [] };
-    displayGroups[label].keys.push(key);
-    displayGroups[label].records.push(...groupRecords);
-  });
-
-  const table = document.createElement('table');
-  table.className = 'doorlock-table';
-  table.innerHTML = `<thead><tr><th>지점</th><th>미연결 방</th><th>특이사항</th></tr></thead>`;
-  const tbody = document.createElement('tbody');
-  function buildBranchRow(label, group){
-    // 도어락 기기가 같은 방에 여러 대(재스캔 등)라 라벨이 같은 값으로 겹칠 수 있어 라벨
-    // 기준으로 중복 제거한다.
-    const byRoomLabel = new Map();
-    group.records.forEach(r=>{
-      const chip = chipBySerial.get(r.serial);
-      if(!chip) return; // 연결됨(문제 없음)이면 표시하지 않는다
-      const rl = doorlockRoomLabel(r);
-      if(!byRoomLabel.has(rl)) byRoomLabel.set(rl, chip);
-    });
-    const chipsSorted = Array.from(byRoomLabel.values())
-      .sort((a,b)=> doorlockRoomLabel(a.record).localeCompare(doorlockRoomLabel(b.record), 'ko', {numeric:true}));
-    // 방에 입실자가 있는지 확인하려면, 이 도어락 지점을 실제 대시보드에 등록된 지점과 먼저
-    // 연결해야 한다(이름 자동 매칭, 안 맞으면 아래 select로 직접 지정). DB.branches가 없는
-    // 화면(공유 링크)에서는 doorlockResolveBranchLink가 그냥 null을 반환해 이 기능 전체가
-    // 조용히 꺼진다.
-    const linkedBranch = doorlockResolveBranchLink(group, label);
-    const tr = document.createElement('tr');
-    const branchTd = document.createElement('td');
-    branchTd.style.cssText = 'font-weight:700;white-space:nowrap;';
-    if(canEdit() && editable){
-      const nameSpan = document.createElement('span');
-      nameSpan.textContent = label;
-      nameSpan.style.cursor = 'pointer';
-      nameSpan.title = '클릭하여 지점명 수정';
-      nameSpan.onclick = ()=>{
-        const input = document.createElement('input');
-        input.type = 'text';
-        input.value = label;
-        input.style.cssText = 'width:130px;font-weight:700;';
-        const commit = ()=>{
-          const val = input.value.trim();
-          if(!DB.doorlockBranchNameOverrides) DB.doorlockBranchNameOverrides = {};
-          // 합쳐진 행일 수 있으므로, 이 행을 구성하는 모든 branchGroup 키에 같은 수정값을
-          // 적용해야 다음 렌더에서도 계속 하나로 합쳐진 채 유지된다.
-          let changed = false;
-          group.keys.forEach(key=>{
-            const before = DB.doorlockBranchNameOverrides[key];
-            if(val) DB.doorlockBranchNameOverrides[key] = val;
-            else delete DB.doorlockBranchNameOverrides[key];
-            if(before !== DB.doorlockBranchNameOverrides[key]) changed = true;
-          });
-          if(changed){
-            logChange(`도어락 지점명 수정: "${label}" → "${val || label}"`);
-            saveDoorlockState();
-            syncDoorlockPublicMirror();
-          }
-          render();
-        };
-        input.addEventListener('keydown', (e)=>{ if(e.key==='Enter') input.blur(); });
-        input.addEventListener('blur', commit);
-        branchTd.innerHTML = '';
-        branchTd.appendChild(input);
-        input.focus(); input.select();
-      };
-      branchTd.appendChild(nameSpan);
-    } else {
-      branchTd.textContent = label;
-    }
-    // 실제 지점 연결 표시 — 입실자 유무를 확인하려면 이 지점이 실제 등록된 지점 중 어디인지
-    // 알아야 한다. 이름으로 자동 매칭되지만 틀릴 수 있어 직접 고를 수 있게 한다.
-    if(DB.branches){
-      const linkRow = document.createElement('div');
-      linkRow.style.cssText = 'font-size:10.5px; color:var(--ink-soft); font-weight:400; margin-top:2px;';
-      if(canEdit() && editable){
-        const linkSelect = document.createElement('select');
-        linkSelect.style.cssText = 'font-size:10.5px; max-width:130px;';
-        linkSelect.title = '입실자 유무 확인을 위해 실제 지점과 연결합니다(이름으로 자동 매칭됨, 다르면 직접 선택)';
-        const noneOpt = document.createElement('option');
-        noneOpt.value = ''; noneOpt.textContent = '지점 연결 안 함';
-        linkSelect.appendChild(noneOpt);
-        DB.branches.slice().sort((a,b)=> branchLabel(a).localeCompare(branchLabel(b),'ko')).forEach(b=>{
-          const opt = document.createElement('option');
-          opt.value = b.id; opt.textContent = branchLabel(b);
-          if(linkedBranch && linkedBranch.id===b.id) opt.selected = true;
-          linkSelect.appendChild(opt);
-        });
-        linkSelect.addEventListener('change', ()=>{
-          const val = linkSelect.value;
-          if(!DB.doorlockBranchLinks) DB.doorlockBranchLinks = {};
-          let changed = false;
-          group.keys.forEach(key=>{
-            const before = DB.doorlockBranchLinks[key];
-            if(val) DB.doorlockBranchLinks[key] = val;
-            else delete DB.doorlockBranchLinks[key];
-            if(before !== DB.doorlockBranchLinks[key]) changed = true;
-          });
-          if(changed){
-            logChange(`도어락 "${label}" 실제 지점 연결 변경`);
-            saveDoorlockState();
-          }
-          render();
-        });
-        linkRow.appendChild(linkSelect);
-      } else if(linkedBranch){
-        linkRow.textContent = `→ ${branchLabel(linkedBranch)}`;
-      }
-      branchTd.appendChild(linkRow);
-    }
-    const roomTd = document.createElement('td');
-    if(chipsSorted.length===0){
-      roomTd.innerHTML = '<span style="color:var(--ink-soft);">전체 연결됨</span>';
-    } else {
-      // td 자체에 display:flex를 주면 table-cell 레이아웃을 벗어나 border-collapse 시
-      // 옆 칸(특이사항)이 줄바꿈으로 길어질 때 테두리 줄이 어긋나 보이는 문제가 있어,
-      // td는 그대로 두고 안에 래퍼 div로만 flex를 적용한다.
-      const chipsWrap = document.createElement('div');
-      chipsWrap.style.cssText = 'display:flex; flex-wrap:wrap; gap:6px;';
-      chipsSorted.forEach(c=>{
-        const r = c.record;
-        const colors = DOORLOCK_STATUS_COLORS[c.status];
-        const chip = document.createElement('span');
-        chip.className = 'badge';
-        chip.style.cssText = `background:${colors.bg}; color:${colors.fg};`;
-        chip.textContent = doorlockRoomLabel(r);
-        const titleParts = [r.lastConnected ? `마지막 연결: ${r.lastConnected}` : '연결 기록 없음'];
-        // 방 번호가 있고(공용구역 등 번호 없는 항목은 애초에 입실자 개념이 없어 건너뜀) 실제
-        // 지점과 연결돼 있으면, 그 지점의 같은 호실번호 방에 재실 입실자가 있는지 확인해서
-        // 있는 방만 테두리로 표시한다(입실자가 없는 방은 급하지 않으므로 굳이 표시하지 않음).
-        if(linkedBranch && r.roomNumber){
-          const realRoom = DB.rooms.find(rm=> rm.branchId===linkedBranch.id && rm.number===r.roomNumber);
-          if(realRoom){
-            if(roomHasActiveResident(realRoom)){
-              chip.style.border = '2px solid var(--accent)';
-              titleParts.push('입실자 있음');
-            } else {
-              titleParts.push('공실');
-            }
-          }
-        }
-        chip.title = titleParts.join(' · ');
-        if(canEdit() && editable){
-          chip.style.cursor = 'pointer';
-          chip.onclick = ()=> showDoorlockActionModal(r.serial, `${label} ${doorlockRoomLabel(r)}`);
-        }
-        chipsWrap.appendChild(chip);
-      });
-      roomTd.appendChild(chipsWrap);
-    }
-    const noteTd = document.createElement('td');
-    const note = group.keys.map(k=> branchNotes[k]).find(Boolean) || '';
-    if(canEdit() && editable){
-      const noteSpan = document.createElement('span');
-      noteSpan.textContent = note || '메모 추가';
-      noteSpan.style.cssText = 'cursor:pointer; white-space:pre-line;' + (note ? '' : 'color:var(--ink-soft);font-style:italic;');
-      noteSpan.title = '클릭하여 특이사항 수정';
-      noteSpan.onclick = ()=>{
-        const textarea = document.createElement('textarea');
-        textarea.value = note;
-        textarea.placeholder = '특이사항 입력';
-        textarea.rows = 2;
-        textarea.style.cssText = 'width:200px; resize:vertical;';
-        const commit = ()=>{
-          const val = textarea.value.trim();
-          if(!DB.doorlockBranchNotes) DB.doorlockBranchNotes = {};
-          // 합쳐진 행일 수 있으므로, 이 행을 구성하는 모든 branchGroup 키에 같은 메모를
-          // 적용해야 다음 렌더에서도 일관되게 보인다.
-          let changed = false;
-          group.keys.forEach(key=>{
-            const before = DB.doorlockBranchNotes[key];
-            if(val) DB.doorlockBranchNotes[key] = val;
-            else delete DB.doorlockBranchNotes[key];
-            if(before !== DB.doorlockBranchNotes[key]) changed = true;
-          });
-          if(changed){
-            syncDoorlockBranchNotesToTodayHistory();
-            logChange(`도어락 "${label}" 특이사항 수정`);
-            saveDoorlockState();
-            syncDoorlockPublicMirror();
-          }
-          render();
-        };
-        // 줄바꿈이 가능한 메모라 Enter는 그대로 줄바꿈으로 두고, blur(다른 곳 클릭)로만 저장한다.
-        textarea.addEventListener('blur', commit);
-        noteTd.innerHTML = '';
-        noteTd.appendChild(textarea);
-        textarea.focus(); textarea.select();
-      };
-      noteTd.appendChild(noteSpan);
-    } else {
-      noteTd.style.whiteSpace = 'pre-line';
-      noteTd.textContent = note || '-';
-    }
-    tr.appendChild(branchTd); tr.appendChild(roomTd); tr.appendChild(noteTd);
-    return tr;
-  }
-  // 지점 구분(입점고시원/먼슬리브)별로 묶어서, 구분 헤더 행 → 그 구분에 속한 지점들(가나다순)
-  // 순서로 렌더링한다. 상단에 입점고시원, 그 아래 먼슬리브 순서로 고정 노출한다.
-  const labelsByCategory = {};
-  Object.keys(displayGroups).forEach(label=>{
-    const cat = doorlockCategoryForGroup(displayGroups[label]);
-    (labelsByCategory[cat] = labelsByCategory[cat] || []).push(label);
-  });
-  DOORLOCK_CATEGORY_ORDER.forEach(cat=>{
-    const labels = labelsByCategory[cat];
-    if(!labels || labels.length===0) return;
-    const headerTr = document.createElement('tr');
-    const headerTd = document.createElement('td');
-    headerTd.colSpan = 3;
-    headerTd.textContent = cat;
-    headerTd.style.cssText = 'font-weight:800; color:var(--accent-ink); background:var(--accent-soft); padding:8px 12px;';
-    headerTr.appendChild(headerTd);
-    tbody.appendChild(headerTr);
-    labels.sort((a,b)=> a.localeCompare(b,'ko')).forEach(label=>{
-      tbody.appendChild(buildBranchRow(label, displayGroups[label]));
-    });
-  });
-  table.appendChild(tbody);
-  box.appendChild(table);
-
-  return box;
-}
-// 같은 방을 가리키는 기기가 여러 개(재스캔 등으로 일련번호만 다르게 중복 등록)일 때, 화면에
-// 보여줄 지점+방 라벨이 같으면 하나만 남긴다(먼저 나온 것을 유지) — 지점별 미연결 표
-// (renderDoorlockDisconnectedSection)의 방 칩 중복 제거와 같은 기준을 이 두 상단 카드
-// (신규 추가된 미연결 방·정상 연결됨)에도 동일하게 적용한다.
-function dedupeDoorlockRecordsByLabel(records){
-  const seen = new Set();
-  const out = [];
-  records.forEach(r=>{
-    const key = doorlockBranchLabel(r.branchGroup) + '__' + doorlockRoomLabel(r);
-    if(seen.has(key)) return;
-    seen.add(key);
-    out.push(r);
-  });
-  return out;
-}
-function renderDoorlockNewIssuesSection(prevRecords, currRecords, prevDate){
-  const prevBySerial = new Map((prevRecords||[]).map(r=>[r.serial, r]));
-  // computeDoorlockChipList와 같은 기준을 쓴다 — 이전 목록에 없다는 것만으로는 신규가 아니다.
-  const added = dedupeDoorlockRecordsByLabel(currRecords.filter(r=>
-    !r.connected && !prevBySerial.has(r.serial) && doorlockNewlyDisconnected(r, prevDate)))
-    .sort((a,b)=> doorlockBranchLabel(a.branchGroup).localeCompare(doorlockBranchLabel(b.branchGroup),'ko'));
-  const box = document.createElement('div');
-  box.className = 'stat-section cleaning-card';
-  box.innerHTML = `<h3 style="margin:0;">신규 추가된 미연결 방 <span class="cnt-badge">${added.length}</span></h3>`;
-  if(added.length===0){
-    box.appendChild(el('div','cleaning-empty','해당 항목이 없습니다.'));
-    return box;
-  }
-  const table = document.createElement('table');
-  table.className = 'doorlock-table';
-  table.innerHTML = `<thead><tr><th>지점</th><th>방</th><th>배터리</th><th>마지막 연결</th></tr></thead>`;
-  const tbody = document.createElement('tbody');
-  added.forEach(r=>{
-    const tr = document.createElement('tr');
-    tr.innerHTML = `<td style="white-space:nowrap;">${esc(doorlockBranchLabel(r.branchGroup))}</td><td>${esc(doorlockRoomLabel(r))}</td><td>${esc(r.battery||'-')}</td><td>${esc(r.lastConnected||'-')}</td>`;
-    tbody.appendChild(tr);
-  });
-  table.appendChild(tbody);
-  box.appendChild(table);
-  return box;
-}
-// 전날(직전 붙여넣기)에는 미연결이었는데 오늘은 연결된 방을 상단에 별도로 모아 보여준다.
-// 하루만 보여주고 자연히 빠진다 — doorlockPrevSnapshot이 매번 한 칸씩 앞으로 이동하므로,
-// 다음 붙여넣기 때는 "그 전날"이 이미 연결 상태였던 것으로 비교되어 더 이상 여기 나오지 않는다.
-function renderDoorlockResolvedSection(prevRecords, currRecords){
-  const prevBySerial = new Map((prevRecords||[]).map(r=>[r.serial, r]));
-  const resolved = dedupeDoorlockRecordsByLabel(currRecords.filter(r=>{
-    const prev = prevBySerial.get(r.serial);
-    return prev && prev.connected===false && r.connected===true;
-  })).sort((a,b)=> doorlockBranchLabel(a.branchGroup).localeCompare(doorlockBranchLabel(b.branchGroup),'ko'));
-  const box = document.createElement('div');
-  box.className = 'stat-section cleaning-card';
-  box.innerHTML = `<h3 style="margin:0;">정상 연결됨 <span class="cnt-badge">${resolved.length}</span></h3>`;
-  if(resolved.length===0){
-    box.appendChild(el('div','cleaning-empty','해당 항목이 없습니다.'));
-    return box;
-  }
-  const table = document.createElement('table');
-  table.className = 'doorlock-table';
-  table.innerHTML = `<thead><tr><th>지점</th><th>방</th></tr></thead>`;
-  const tbody = document.createElement('tbody');
-  resolved.forEach(r=>{
-    const tr = document.createElement('tr');
-    tr.innerHTML = `<td style="white-space:nowrap;">${esc(doorlockBranchLabel(r.branchGroup))}</td><td>${esc(doorlockRoomLabel(r))}</td>`;
-    tbody.appendChild(tr);
-  });
-  table.appendChild(tbody);
-  box.appendChild(table);
-  return box;
-}
-// 도어락 화면(과거 날짜 이동 등)만 다시 그린다. 로그인 없는 공유 화면(?public=doorlock)에는
-// 지점 목록·상단 메뉴 등 나머지 앱 상태가 없으므로, 전체 render()를 부르면 그 상태를 읽으려다
-// 오류가 난다 — 공유 화면일 때는 도어락 섹션만 직접 다시 그린다.
-function refreshDoorlockDisplay(){
-  if(DOORLOCK_PUBLIC_VIEW){
-    const main = document.getElementById('main');
-    main.innerHTML = '';
-    main.appendChild(renderDoorlockView());
-  } else {
-    render();
-  }
-}
-function renderDoorlockView(){
-  const wrap = document.createElement('div');
-  wrap.style.paddingTop = '18px';
-
-  const headerBox = document.createElement('div');
-  headerBox.className = 'stat-section';
-  headerBox.innerHTML = DOORLOCK_PUBLIC_VIEW
-    ? `<h3>도어락 연결 현황 (공유 링크)</h3>
-       <div style="font-size:12px;color:var(--ink-soft);margin-bottom:12px;">
-         조회 전용 공유 화면입니다. ${DB.doorlockImportDate ? `마지막으로 갱신된 날짜: ${esc(DB.doorlockImportDate)}` : '아직 데이터가 없습니다.'}
-       </div>`
-    : `<h3>도어락 연결 관리</h3>
-       <div style="font-size:12px;color:var(--ink-soft);margin-bottom:12px;">
-         도어락 관리 업체 표(기기명·일련번호·소속명·공간명·SSID·배터리·마지막 연결·소유자, 헤더 포함)를 통째로 붙여넣으면 지점별 미연결 방 현황으로 정리됩니다.
-         ${DB.doorlockImportDate ? `마지막으로 붙여넣은 날짜: ${esc(DB.doorlockImportDate)}` : '아직 붙여넣은 데이터가 없습니다.'}
-       </div>`;
-  if(canEdit()){
-    const btnRow = document.createElement('div');
-    btnRow.style.cssText = 'display:flex; gap:8px; flex-wrap:wrap;';
-    const pasteBtn = document.createElement('button');
-    pasteBtn.className = 'btn primary';
-    pasteBtn.textContent = '도어락 데이터 붙여넣기';
-    pasteBtn.onclick = showDoorlockPasteModal;
-    btnRow.appendChild(pasteBtn);
-    if((DB.doorlocks||[]).length > 0){
-      const resetBtn = document.createElement('button');
-      resetBtn.className = 'btn danger';
-      resetBtn.textContent = '데이터 초기화';
-      resetBtn.onclick = ()=>{
-        showConfirm('도어락 데이터를 모두 초기화할까요?\n지금까지 붙여넣은 데이터, 이전 비교 기록, 지점명 수정 내역, 처리 방법 태그, 특이사항 메모, 실제 지점 연결, 히스토리가 모두 삭제됩니다.', ()=>{
-          DB.doorlocks = [];
-          DB.doorlockPrevSnapshot = null;
-          DB.doorlockImportDate = '';
-          DB.doorlockBranchNameOverrides = {};
-          DB.doorlockActionTags = {};
-          DB.doorlockBranchNotes = {};
-          DB.doorlockBranchLinks = {};
-          DB.doorlockHistory = [];
-          UI.doorlockHistoryOffset = 0;
-          logChange('도어락 데이터 초기화');
-          saveDoorlockState(); syncDoorlockPublicMirror(); render();
-        });
-      };
-      btnRow.appendChild(resetBtn);
-    }
-    headerBox.appendChild(btnRow);
-  }
-  wrap.appendChild(headerBox);
-
-  const records = DB.doorlocks || [];
-  if(records.length===0){
-    wrap.appendChild(el('div','empty-hint','아직 붙여넣은 도어락 데이터가 없습니다.'));
-    return wrap;
-  }
-
-  // 히스토리 탐색: offset 0 = 오늘(최신), 값이 클수록 과거(최대 4 = 최근 5일 중 가장 오래된 날).
-  const history = DB.doorlockHistory || [];
-  const maxOffset = Math.max(0, history.length - 1);
-  if(UI.doorlockHistoryOffset == null || UI.doorlockHistoryOffset > maxOffset) UI.doorlockHistoryOffset = Math.min(UI.doorlockHistoryOffset || 0, maxOffset);
-  const offset = UI.doorlockHistoryOffset;
-  const snap = getDoorlockSnapshotAt(offset) ||
-    { date: DB.doorlockImportDate, records, prevRecords: (DB.doorlockPrevSnapshot && DB.doorlockPrevSnapshot.records) || null, prevDate: (DB.doorlockPrevSnapshot && DB.doorlockPrevSnapshot.date) || null, actionTags: DB.doorlockActionTags || {}, branchNotes: DB.doorlockBranchNotes || {} };
-  const viewRecords = snap.records;
-  const viewPrevRecords = snap.prevRecords;
-  const isLatest = offset === 0;
-
-  {
-    const navBar = document.createElement('div');
-    navBar.style.cssText = 'display:flex; align-items:center; justify-content:center; gap:12px; margin-bottom:14px;';
-    if(maxOffset > 0){
-      const prevBtn = document.createElement('button');
-      prevBtn.className = 'btn small';
-      prevBtn.textContent = '◀ 이전';
-      prevBtn.disabled = offset >= maxOffset;
-      prevBtn.onclick = ()=>{ UI.doorlockHistoryOffset = Math.min(maxOffset, offset+1); refreshDoorlockDisplay(); };
-      navBar.appendChild(prevBtn);
-    }
-    const dateLabel = document.createElement('span');
-    dateLabel.style.cssText = 'font-weight:700; font-size:13px; min-width:120px; text-align:center;';
-    dateLabel.textContent = `${(snap.date||'').replace(/-/g,'/')}${isLatest ? ' (최신)' : ''}`;
-    navBar.appendChild(dateLabel);
-    if(maxOffset > 0){
-      const nextBtn = document.createElement('button');
-      nextBtn.className = 'btn small';
-      nextBtn.textContent = '다음 ▶';
-      nextBtn.disabled = isLatest;
-      nextBtn.onclick = ()=>{ UI.doorlockHistoryOffset = Math.max(0, offset-1); refreshDoorlockDisplay(); };
-      navBar.appendChild(nextBtn);
-    }
-    if(!DOORLOCK_PUBLIC_VIEW){
-      const shareBtn = document.createElement('button');
-      shareBtn.className = 'btn small';
-      shareBtn.textContent = '공유하기';
-      shareBtn.title = '로그인 없이 이 날짜의 도어락 현황을 볼 수 있는 링크를 복사합니다';
-      shareBtn.onclick = ()=>{
-        const url = `${location.origin}${location.pathname}?public=doorlock&date=${encodeURIComponent(snap.date || '')}`;
-        navigator.clipboard.writeText(url).then(()=>{
-          const orig = shareBtn.textContent;
-          shareBtn.textContent = '복사됨';
-          setTimeout(()=>{ shareBtn.textContent = orig; }, 1500);
-        }).catch(()=> showAlert(`링크 복사에 실패했습니다. 직접 복사해주세요:\n${url}`));
-      };
-      navBar.appendChild(shareBtn);
-    }
-    wrap.appendChild(navBar);
-    // 붙여넣은 기기 수가 지난번과 크게 다르면 목록이 잘렸을 가능성이 높다(업체 페이지에서
-    // 보이는 만큼만 복사되는 경우). 실제로 하루 만에 100대 -> 179대, 178대 -> 113대처럼
-    // 널뛴 적이 있고, 그 때문에 원래 끊겨 있던 방이 "신규 미연결"로 잡히는 문제가 있었다.
-    // 판정 자체는 마지막 연결 시각으로 보정하지만, 목록이 빠진 사실은 담당자가 알아야 한다.
-    if(viewPrevRecords && viewPrevRecords.length){
-      const curN = viewRecords.length, prevN = viewPrevRecords.length;
-      const gap = Math.abs(curN - prevN) / Math.max(curN, prevN);
-      const countLine = document.createElement('div');
-      const odd = gap >= 0.2;
-      countLine.style.cssText = 'text-align:center; font-size:11.5px; margin:-6px 0 14px;'
-        + (odd ? 'color:var(--st-hold);font-weight:600;' : 'color:var(--ink-soft);');
-      countLine.textContent = odd
-        ? `⚠ 기기 ${curN}대 (지난 기록 ${prevN}대) — 목록이 잘렸을 수 있습니다. 업체 페이지에서 전체 목록이 복사됐는지 확인해주세요.`
-        : `기기 ${curN}대 (지난 기록 ${prevN}대)`;
-      wrap.appendChild(countLine);
-    }
-    if(maxOffset > 0 && !isLatest){
-      wrap.appendChild(el('div', null, '지난 기록을 보고 있습니다(수정 불가) · "다음 ▶"을 눌러 최신으로 돌아갈 수 있습니다.', 'font-size:11.5px;color:var(--ink-soft);text-align:center;margin-bottom:14px;'));
-    }
-  }
-
-  // 처리 방법 요약도 이제 날짜별로 얼려서 보관되므로(doorlockHistory의 actionTags), 과거
-  // 날짜를 보고 있어도 그 날짜의 기록을 보여준다 — 다만 수정은 최신일 때만 가능하다.
-  {
-    const actionSummary = renderDoorlockActionSummary(snap.actionTags, isLatest);
-    if(actionSummary) wrap.appendChild(actionSummary);
-  }
-
-  if(viewPrevRecords && viewPrevRecords.length){
-    const diffGrid = document.createElement('div');
-    diffGrid.className = 'cleaning-cards-grid';
-    diffGrid.appendChild(renderDoorlockNewIssuesSection(viewPrevRecords, viewRecords, snap.prevDate));
-    diffGrid.appendChild(renderDoorlockResolvedSection(viewPrevRecords, viewRecords));
-    wrap.appendChild(diffGrid);
-  }
-  wrap.appendChild(renderDoorlockDisconnectedSection(viewRecords, viewPrevRecords, snap.date, isLatest, snap.branchNotes, snap.prevDate));
-
-  return wrap;
-}
-
 /* ---------------- custom alert/confirm (샌드박스 iframe에서 window.alert/confirm이
    막히는 경우를 대비해 네이티브 다이얼로그 대신 사용) ---------------- */
 function showAlert(message){
@@ -11183,21 +10233,6 @@ async function initApp(user){
   if(canEdit() && DB.residents.length !== beforeCount) scheduleSave();
   applyLoadedCore(DB);
   if(canEdit() && forSaleMigratedCount) scheduleSave();   // 판매중 플래그 이전 결과를 한 번 저장
-  // 도어락 데이터는 별도 문서(DOORLOCK_DOC)에서 불러온다 — 이 부분만 실패해도 이미 불러온
-  // 지점/호실/입실자 같은 핵심 데이터는 그대로 유지되도록 별도 try/catch로 분리한다.
-  try{
-    const doorlockSnap = await DOORLOCK_DOC.get();
-    applyDoorlockCore(doorlockSnap.exists ? doorlockSnap.data() : {});
-  }catch(e){
-    // 이 실패는 예전에 콘솔에만 남기고 조용히 넘어갔는데, 그러면 "붙여넣은 데이터가 사라졌다"는
-    // 신고를 받아도 새로고침 캐시 문제인지 권한 문제인지 알 방법이 없었다. 반드시 화면에 실제
-    // 오류를 보여준다 — 이 경고가 뜨면 권한(규칙) 문제, 안 뜨는데도 비어있으면 오래된 캐시로
-    // 실행 중이라는 뜻이다.
-    console.error('도어락 데이터 불러오기 실패:', e);
-    const detail = (e && e.message) ? e.message : String(e);
-    showAlert(`도어락 데이터를 불러오지 못했습니다. 도어락 관리 화면이 비어있거나 초기화된 것처럼 보일 수 있습니다.\n\n오류 내용: ${detail}\n\n이 창을 스크린샷으로 남겨주시면 원인을 바로 확인할 수 있습니다.`);
-    applyDoorlockCore({});
-  }
   // 방 가격 원장도 별도 문서라 따로 읽는다(연장 계산기와 공유하는 값).
   await loadRoomPrices();
   if(canEdit()) processScheduledLeaves();
@@ -11541,63 +10576,19 @@ function showChangePasswordModal(){
   document.body.appendChild(overlay);
 }
 
-// 도어락 현황 공유 링크(?public=doorlock)는 로그인 절차를 아예 건너뛴다 — Firebase 인증 상태
-// 구독 자체를 등록하지 않아, 링크를 연 사람의 기기에 로그인 세션이 없어도 로그인 화면이
-// 뜨지 않는다.
-function isPublicDoorlockShareUrl(){
-  return new URLSearchParams(location.search).get('public') === 'doorlock';
-}
-async function initPublicDoorlockView(){
-  DOORLOCK_PUBLIC_VIEW = true;
-  document.getElementById('loginScreen').style.display = 'none';
-  document.getElementById('pendingScreen').style.display = 'none';
-  document.getElementById('app').style.display = '';
-  document.querySelector('#app > header.top').style.display = 'none';
-  DB = { doorlocks: [], doorlockPrevSnapshot: null, doorlockImportDate: '', doorlockHistory: [],
-    doorlockBranchNameOverrides: {}, doorlockBranchNotes: {}, doorlockActionTags: {} };
-  try{
-    const snap = await DOORLOCK_PUBLIC_DOC.get();
-    if(snap.exists){
-      const d = snap.data() || {};
-      DB.doorlocks = d.doorlocks || [];
-      DB.doorlockPrevSnapshot = d.doorlockPrevSnapshot || null;
-      DB.doorlockImportDate = d.doorlockImportDate || '';
-      DB.doorlockHistory = d.doorlockHistory || [];
-      DB.doorlockBranchNameOverrides = d.doorlockBranchNameOverrides || {};
-      DB.doorlockBranchNotes = d.doorlockBranchNotes || {};
-      DB.doorlockActionTags = d.doorlockActionTags || {};
-    }
-  }catch(e){
-    console.error('공유용 도어락 데이터 조회 실패:', e);
-  }
-  UI.doorlockHistoryOffset = 0;
-  const requestedDate = new URLSearchParams(location.search).get('date');
-  if(requestedDate){
-    const idx = DB.doorlockHistory.findIndex(h=> h.date === requestedDate);
-    if(idx >= 0) UI.doorlockHistoryOffset = DB.doorlockHistory.length - 1 - idx;
-  }
-  const main = document.getElementById('main');
-  main.innerHTML = '';
-  main.appendChild(renderDoorlockView());
-}
-
 let suppressAuthHandling = false;
-if(isPublicDoorlockShareUrl()){
-  initPublicDoorlockView();
-} else {
-  firebase.auth().onAuthStateChanged(user=>{
-    if(suppressAuthHandling) return;
-    if(user){ initApp(user); }
-    else {
-      CURRENT_USER = null; USER_ROLE = null;
-      if(firestoreUnsubscribe){ firestoreUnsubscribe(); firestoreUnsubscribe = null; }
-      if(contractsUnsubscribe){ contractsUnsubscribe(); contractsUnsubscribe = null; }
-      if(historyUnsubscribe){ historyUnsubscribe(); historyUnsubscribe = null; }
-      if(roomPricesUnsubscribe){ roomPricesUnsubscribe(); roomPricesUnsubscribe = null; }
-      showLoginScreen();
-    }
-  });
-}
+firebase.auth().onAuthStateChanged(user=>{
+  if(suppressAuthHandling) return;
+  if(user){ initApp(user); }
+  else {
+    CURRENT_USER = null; USER_ROLE = null;
+    if(firestoreUnsubscribe){ firestoreUnsubscribe(); firestoreUnsubscribe = null; }
+    if(contractsUnsubscribe){ contractsUnsubscribe(); contractsUnsubscribe = null; }
+    if(historyUnsubscribe){ historyUnsubscribe(); historyUnsubscribe = null; }
+    if(roomPricesUnsubscribe){ roomPricesUnsubscribe(); roomPricesUnsubscribe = null; }
+    showLoginScreen();
+  }
+});
 // PC를 계속 켜둔 채 로그인 화면을 새로고침 없이 며칠씩 열어두면 initApp()이 다시 실행되지
 // 않아 날짜가 바뀌어도 자동 백업/리터치 자동 예약이 안 갱신된다. 그래서 별도로 주기적으로
 // (1시간마다) 오늘 백업이 있는지, 새로 리터치 예약 대상이 된 방이 있는지 확인한다.
